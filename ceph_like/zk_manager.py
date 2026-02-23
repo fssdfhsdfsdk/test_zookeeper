@@ -1,6 +1,6 @@
 """
 ZooKeeper 集群管理模块
-封装ZK操作，提供服务注册、心跳、选举等功能
+封装ZK操作，提供服务注册，心跳、选举等功能
 """
 
 import json
@@ -21,7 +21,6 @@ try:
         ConnectionLoss,
     )
 
-    # 兼容新旧版本
     try:
         from kazoo.exceptions import SessionExpired
     except (ImportError, AttributeError):
@@ -79,7 +78,7 @@ class ZKManager:
     def start(self) -> bool:
         """连接到ZK集群"""
         if KazooClient is None:
-            logger.error("KazooClient not available - kazoo not properly installed")
+            logger.error("KazooClient not available")
             return False
 
         try:
@@ -117,7 +116,6 @@ class ZKManager:
                 logger.error(f"关闭 ZK 连接失败: {e}")
 
     def _on_state_change(self, state: str):
-        """ZK 连接状态变化回调"""
         try:
             if state == KazooState.LOST:
                 logger.error("❌ Session 丢失")
@@ -129,7 +127,6 @@ class ZKManager:
             pass
 
     def is_connected(self) -> bool:
-        """检查是否连接"""
         try:
             return self.zk and self.zk.state == KazooState.CONNECTED
         except:
@@ -138,7 +135,6 @@ class ZKManager:
     # ========== 服务注册 ==========
 
     def register_osd(self, osd_info: Dict[str, Any]) -> bool:
-        """注册OSD节点"""
         try:
             path = f"{self.OSD_PATH}/{osd_info['id']}"
             data = json.dumps(osd_info).encode()
@@ -150,7 +146,6 @@ class ZKManager:
             return False
 
     def register_mds(self, mds_info: Dict[str, Any]) -> bool:
-        """注册MDS节点"""
         try:
             path = f"{self.MDS_PATH}/{mds_info['id']}"
             data = json.dumps(mds_info).encode()
@@ -164,7 +159,6 @@ class ZKManager:
     # ========== 服务发现 ==========
 
     def get_all_osds(self) -> List[Dict[str, Any]]:
-        """获取所有OSD节点"""
         try:
             children = self.zk.get_children(self.OSD_PATH)
             osds = []
@@ -181,7 +175,6 @@ class ZKManager:
             return []
 
     def get_all_mds(self) -> List[Dict[str, Any]]:
-        """获取所有MDS节点"""
         try:
             children = self.zk.get_children(self.MDS_PATH)
             mds_list = []
@@ -198,8 +191,6 @@ class ZKManager:
             return []
 
     def watch_osds(self, callback: Callable[[List[Dict]], None]):
-        """监听OSD节点变化"""
-
         def watcher(event):
             osds = self.get_all_osds()
             callback(osds)
@@ -211,59 +202,38 @@ class ZKManager:
         except Exception as e:
             logger.error(f"监听 OSD 变化失败: {e}")
 
-    def watch_mds(self, callback: Callable[[List[Dict]], None]):
-        """监听MDS节点变化"""
-
-        def watcher(event):
-            mds_list = self.get_all_mds()
-            callback(mds_list)
-
-        try:
-            self.zk.get_children(self.MDS_PATH, watch=watcher)
-            mds_list = self.get_all_mds()
-            callback(mds_list)
-        except Exception as e:
-            logger.error(f"监听 MDS 变化失败: {e}")
-
-    # ========== 分布式锁 ==========
-
-    def acquire_lock(self, lock_name: str, timeout: float = 10):
-        """获取分布式锁"""
-        try:
-            lock = Lock(self.zk, f"{self.LOCKS_PATH}/{lock_name}")
-            result = lock.acquire(timeout=timeout)
-            if result:
-                return lock
-            return None
-        except Exception as e:
-            logger.error(f"获取锁失败: {e}")
-            return None
-
-    def release_lock(self, lock):
-        """释放分布式锁"""
-        try:
-            lock.release()
-        except Exception as e:
-            logger.error(f"释放锁失败: {e}")
-
     # ========== Leader 选举 ==========
 
     def elect_leader(self, node_id: str) -> bool:
         """尝试竞选 Leader"""
         try:
+            # 先检查 Leader 节点状态
+            try:
+                data, stat = self.zk.get(self.LEADER_PATH)
+                logger.info(
+                    f"Leader 节点已存在: {data.decode()}, version: {stat.version}"
+                )
+                return False
+            except NoNodeException:
+                logger.info("Leader 节点不存在，准备创建...")
+
+            # 尝试创建 Leader 节点
             self.zk.create(self.LEADER_PATH, node_id.encode(), ephemeral=True)
-            logger.info(f"👑 {node_id} 成为 Leader")
+            logger.info(f"👑 {node_id} 创建 Leader 节点成功!")
             return True
+
         except NodeExistsException:
+            logger.info(f"Leader 节点已存在，{node_id} 竞选失败")
             return False
         except Exception as e:
-            logger.error(f"选举失败: {e}")
+            logger.error(f"选举过程异常: {e}")
             return False
 
     def watch_leader(self, callback: Callable[[Optional[str]], None]):
         """监听 Leader 变化"""
 
         def watcher(event):
+            logger.info(f"Leader 节点变化事件: {event}")
             try:
                 data, _ = self.zk.get(self.LEADER_PATH)
                 leader_id = data.decode() if data else None
@@ -272,6 +242,13 @@ class ZKManager:
             callback(leader_id)
 
         try:
+            # 先获取当前状态
+            try:
+                data, stat = self.zk.get(self.LEADER_PATH)
+                logger.info(f"当前 Leader: {data.decode()}, 设置监听...")
+            except NoNodeException:
+                logger.info("当前无 Leader，设置监听...")
+
             self.zk.exists(self.LEADER_PATH, watch=watcher)
         except Exception as e:
             logger.error(f"监听 Leader 失败: {e}")
@@ -290,7 +267,6 @@ class ZKManager:
     # ========== 元数据操作 ==========
 
     def create_block(self, block_id: str, metadata: Dict[str, Any]) -> bool:
-        """创建 Block 元数据"""
         try:
             path = f"{self.BLOCKS_PATH}/{block_id}"
             data = json.dumps(metadata).encode()
@@ -303,7 +279,6 @@ class ZKManager:
             return False
 
     def update_block(self, block_id: str, metadata: Dict[str, Any]) -> bool:
-        """更新 Block 元数据"""
         try:
             path = f"{self.BLOCKS_PATH}/{block_id}"
             data = json.dumps(metadata).encode()
@@ -314,7 +289,6 @@ class ZKManager:
             return False
 
     def get_block(self, block_id: str) -> Optional[Dict]:
-        """获取 Block 元数据"""
         try:
             path = f"{self.BLOCKS_PATH}/{block_id}"
             data, _ = self.zk.get(path)
@@ -326,7 +300,6 @@ class ZKManager:
             return None
 
     def get_all_blocks(self) -> List[Dict]:
-        """获取所有 Block"""
         try:
             children = self.zk.get_children(self.BLOCKS_PATH)
             blocks = []
@@ -347,7 +320,6 @@ class ZKManager:
     def create_device(
         self, client_id: str, device_id: str, config: Dict[str, Any]
     ) -> bool:
-        """创建设备"""
         try:
             path = f"{self.DEVICES_PATH}/{device_id}"
             metadata = {
@@ -368,7 +340,6 @@ class ZKManager:
             return False
 
     def get_device(self, device_id: str) -> Optional[Dict]:
-        """获取设备信息"""
         try:
             path = f"{self.DEVICES_PATH}/{device_id}"
             data, _ = self.zk.get(path)
@@ -380,7 +351,6 @@ class ZKManager:
             return None
 
     def get_client_devices(self, client_id: str) -> List[Dict]:
-        """获取客户端的所有设备"""
         try:
             children = self.zk.get_children(self.DEVICES_PATH)
             devices = []
@@ -400,7 +370,6 @@ class ZKManager:
     # ========== 心跳 ==========
 
     def send_heartbeat(self, node_type: NodeType, node_id: str, status: Dict[str, Any]):
-        """发送心跳"""
         try:
             path = f"{self.HEARTBEAT_PATH}/{node_type.value}/{node_id}"
             status["timestamp"] = time.time()
