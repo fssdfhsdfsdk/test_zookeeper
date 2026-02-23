@@ -87,11 +87,6 @@ class StorageClient:
     def _watch_osds(self):
         """监听 OSD 变化"""
 
-        # 保存旧状态
-        old_osd_ids = set()
-        with self.lock:
-            old_osd_ids = {n["id"] for n in self.hash_ring.get_all_nodes()}
-
         def on_osds_change(osds: List[Dict]):
             # 获取新的在线 OSD
             new_online_osds = {
@@ -99,18 +94,17 @@ class StorageClient:
             }
 
             with self.lock:
+                old_online_osds = {n["id"] for n in self.hash_ring.get_all_nodes()}
+
                 # 重建哈希环
                 self.hash_ring = ConsistentHashRing()
                 for osd in osds:
                     if osd.get("status") == "online":
                         self.hash_ring.add_node(osd)
 
-            # 计算变化
-            added = new_online_osds - old_osd_ids
-            removed = old_osd_ids - new_online_osds
-
-            # 更新旧状态
-            old_osd_ids = new_online_osds
+                # 计算变化
+                added = new_online_osds - old_online_osds
+                removed = old_online_osds - new_online_osds
 
             if added:
                 logger.warning(f"🟢 OSD 加入: {added}")
