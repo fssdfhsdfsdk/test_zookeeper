@@ -19,7 +19,7 @@ from typing import Dict, Any, List, Optional
 
 from zk_manager import ZKManager, NodeType
 from consistent_hash import ConsistentHashRing
-from version_vector import VectorClock, VersionedValue, ConflictResolver
+from version_vector import VectorClock
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,14 +61,25 @@ class StorageClient:
         # 锁
         self.lock = threading.RLock()
 
+        # 运行状态
+        self.running = False
+
     def connect(self) -> bool:
         """连接集群"""
         if not self.zk.start():
             logger.error("❌ ZK 连接失败")
             return False
 
+        self.running = True
+
+        # 监听 OSD 变化
         self._watch_osds()
+
+        # 加载设备信息
         self._load_devices()
+
+        # 启动定期刷新线程（防止watch丢失）
+        self._start_refresh_loop()
 
         logger.info("✅ 客户端连接成功")
         return True
@@ -76,19 +87,30 @@ class StorageClient:
     def _watch_osds(self):
         """监听 OSD 变化"""
 
+        # 保存旧状态
+        old_osd_ids = set()
+        with self.lock:
+            old_osd_ids = {n["id"] for n in self.hash_ring.get_all_nodes()}
+
         def on_osds_change(osds: List[Dict]):
+            # 获取新的在线 OSD
+            new_online_osds = {
+                osd["id"] for osd in osds if osd.get("status") == "online"
+            }
+
             with self.lock:
+                # 重建哈希环
                 self.hash_ring = ConsistentHashRing()
                 for osd in osds:
                     if osd.get("status") == "online":
                         self.hash_ring.add_node(osd)
 
-            added = set(osd.get("id") for osd in osds) - {
-                n["id"] for n in self.hash_ring.get_all_nodes()
-            }
-            removed = {n["id"] for n in self.hash_ring.get_all_nodes()} - set(
-                osd.get("id") for osd in osds
-            )
+            # 计算变化
+            added = new_online_osds - old_osd_ids
+            removed = old_osd_ids - new_online_osds
+
+            # 更新旧状态
+            old_osd_ids = new_online_osds
 
             if added:
                 logger.warning(f"🟢 OSD 加入: {added}")
@@ -98,6 +120,49 @@ class StorageClient:
             logger.info(f"📊 OSD 拓扑更新: {len(self.hash_ring)} 节点")
 
         self.zk.watch_osds(on_osds_change)
+
+    def _start_refresh_loop(self):
+        """启动定期刷新线程，防止watch丢失"""
+
+        def refresh_loop():
+            while self.running:
+                time.sleep(10)  # 每10秒刷新一次
+                try:
+                    self._refresh_osds()
+                except Exception as e:
+                    logger.debug(f"刷新 OSD 状态失败: {e}")
+
+        t = threading.Thread(target=refresh_loop, daemon=True)
+        t.start()
+
+    def _refresh_osds(self):
+        """刷新 OSD 状态"""
+        osds = self.zk.get_all_osds()
+        new_online_osds = {osd["id"] for osd in osds if osd.get("status") == "online"}
+
+        with self.lock:
+            old_online_osds = {n["id"] for n in self.hash_ring.get_all_nodes()}
+
+            # 如果发现不一致，强制更新
+            if new_online_osds != old_online_osds:
+                logger.warning(
+                    f"🔄 检测到 OSD 状态不一致，强制刷新: 旧={old_online_osds}, 新={new_online_osds}"
+                )
+
+                self.hash_ring = ConsistentHashRing()
+                for osd in osds:
+                    if osd.get("status") == "online":
+                        self.hash_ring.add_node(osd)
+
+                added = new_online_osds - old_online_osds
+                removed = old_online_osds - new_online_osds
+
+                if added:
+                    logger.warning(f"🟢 OSD 加入: {added}")
+                if removed:
+                    logger.error(f"🔴 OSD 下线: {removed}")
+
+                logger.info(f"📊 OSD 拓扑刷新: {len(self.hash_ring)} 节点")
 
     def _load_devices(self):
         """加载设备信息"""
@@ -234,6 +299,9 @@ class StorageClient:
         return self.version_clocks[key]
 
     def write(self, key: str, value: str, device_id: str = None) -> bool:
+        # 每次写入前刷新 OSD 状态
+        self._refresh_osds()
+
         with self.lock:
             replicas = self.hash_ring.get_replicas(key, self.replication_count)
             if not replicas:
@@ -257,6 +325,9 @@ class StorageClient:
             return success
 
     def read(self, key: str) -> Optional[str]:
+        # 每次读取前刷新 OSD 状态
+        self._refresh_osds()
+
         with self.lock:
             primary = self.hash_ring.get_node(key)
             if not primary:
@@ -342,6 +413,9 @@ class StorageClient:
     # ========== 集群状态 ==========
 
     def get_cluster_status(self) -> Dict[str, Any]:
+        # 读取前刷新状态
+        self._refresh_osds()
+
         return {
             "client_id": self.client_id,
             "connected": self.zk.is_connected(),
@@ -357,6 +431,7 @@ class StorageClient:
         }
 
     def disconnect(self):
+        self.running = False
         self.zk.stop()
         logger.info("客户端已断开")
 
@@ -414,6 +489,7 @@ def main():
   
   status                           - 集群状态
   topology                         - 拓扑信息
+  refresh                          - 强制刷新OSD状态
   help                             - 显示帮助
                 """)
 
@@ -466,6 +542,10 @@ def main():
             elif action == "status":
                 status = client.get_cluster_status()
                 print(json.dumps(status, indent=2))
+
+            elif action == "refresh":
+                client._refresh_osds()
+                print("✅ OSD 状态已刷新")
 
             elif action == "topology":
                 topo = client.get_topology()

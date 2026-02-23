@@ -50,3 +50,21 @@ Warning: kazoo not installed. Run: pip install kazoo: cannot import name 'Sessio
 ```
 
 Leader节点存在但是数据为空。这意味着之前的选举创建了一个空节点。我需要：1. 在选举时检查Leader节点是否为空2. 如果为空，删除它并重新创建让我修复elect_leader函数。
+
+
+# 【】
+
+操作顺序： 先删除osd3（client感知），再拉起来（client未感知）。然后删除osd1（client未感知）、osd2（client未感知）
+最终状态是有2个osd，实际只有1个
+```
+2026-02-23 18:30:10,322 - [ZKManager] - ⚠️ 读取失败: mydevice2:0
+> status
+{
+  "client_id": "client-1",
+  "connected": true,
+  "osd_count": 2,
+  "device_count": 2,
+  "leader_mds": "mds-2"
+}
+> 
+```
