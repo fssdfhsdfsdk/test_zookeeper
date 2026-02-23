@@ -88,25 +88,40 @@ pip install kazoo
 
 确保 ZooKeeper 集群已启动，监听端口 2181-2183。
 
-### 3. 启动集群
+### 3. 启动集群（两种方式）
+
+**方式一：直接运行（推荐）**
 
 ```bash
-# 启动 OSD 节点
-python -m ceph_like.osd_node osd-1 9100
-python -m ceph_like.osd_node osd-2 9101
-python -m ceph_like.osd_node osd-3 9102
+cd ceph_like
 
-# 启动 MDS 节点
-python -m ceph_like.mds_node mds-1 9110
-python -m ceph_like.mds_node mds-2 9111
+# 终端1: 启动 OSD 节点
+python osd_node.py osd-1 9100
 
-# 启动数据迁移服务
-python -m ceph_like.rebalancer
+# 终端2: 启动更多 OSD
+python osd_node.py osd-2 9101
+python osd_node.py osd-3 9102
+
+# 终端3: 启动 MDS 节点
+python mds_node.py mds-1 9110
+python mds_node.py mds-2 9111
+
+# 终端4: 启动迁移服务
+python rebalancer.py
+
+# 终端5: 启动客户端
+python storage_client.py --client-id client-1
 ```
 
-### 4. 启动客户端
+**方式二：安装后运行**
 
 ```bash
+cd ceph_like
+pip install -e .
+
+# 然后可以从任意目录运行
+python -m ceph_like.osd_node osd-1 9100
+python -m ceph_like.mds_node mds-1 9110
 python -m ceph_like.storage_client --client-id client-1
 ```
 
@@ -187,6 +202,7 @@ help
 ```
 ceph_like/
 ├── config.ini          # 配置文件
+├── setup.py           # 安装配置
 ├── zk_manager.py      # ZK 管理模块
 ├── osd_node.py        # OSD 存储节点
 ├── mds_node.py        # MDS 元数据服务器

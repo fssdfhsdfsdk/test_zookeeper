@@ -13,22 +13,24 @@ from enum import Enum
 try:
     from kazoo.client import KazooClient
     from kazoo.client import KazooState
-    from kazoo.recipe.cache import TreeCache
     from kazoo.recipe.lock import Lock
-    from kazoo.recipe.election import Election
     from kazoo.exceptions import (
         NodeExistsException,
         NoNodeException,
         BadVersionException,
         ConnectionLoss,
-        SessionExpired,
     )
-except ImportError:
-    print("Warning: kazoo not installed. Run: pip install kazoo")
+
+    # 兼容新旧版本
+    try:
+        from kazoo.exceptions import SessionExpired
+    except (ImportError, AttributeError):
+        SessionExpired = Exception
+except (ImportError, AttributeError) as e:
+    print(f"Warning: kazoo import error: {e}")
     KazooClient = None
     KazooState = None
     Lock = None
-    Election = None
     NodeExistsException = Exception
     NoNodeException = Exception
     BadVersionException = Exception
@@ -77,7 +79,7 @@ class ZKManager:
     def start(self) -> bool:
         """连接到ZK集群"""
         if KazooClient is None:
-            logger.error("KazooClient not available")
+            logger.error("KazooClient not available - kazoo not properly installed")
             return False
 
         try:
@@ -116,16 +118,22 @@ class ZKManager:
 
     def _on_state_change(self, state: str):
         """ZK 连接状态变化回调"""
-        if state == KazooState.LOST:
-            logger.error("❌ Session 丢失")
-        elif state == KazooState.SUSPENDED:
-            logger.warning("⚠️ 连接中断")
-        elif state == KazooState.CONNECTED:
-            logger.info("✅ ZK 连接已恢复")
+        try:
+            if state == KazooState.LOST:
+                logger.error("❌ Session 丢失")
+            elif state == KazooState.SUSPENDED:
+                logger.warning("⚠️ 连接中断")
+            elif state == KazooState.CONNECTED:
+                logger.info("✅ ZK 连接已恢复")
+        except:
+            pass
 
     def is_connected(self) -> bool:
         """检查是否连接"""
-        return self.zk and self.zk.state == KazooState.CONNECTED
+        try:
+            return self.zk and self.zk.state == KazooState.CONNECTED
+        except:
+            return False
 
     # ========== 服务注册 ==========
 
@@ -134,15 +142,7 @@ class ZKManager:
         try:
             path = f"{self.OSD_PATH}/{osd_info['id']}"
             data = json.dumps(osd_info).encode()
-
-            # 使用临时顺序节点 + 心跳
-            self.zk.create(
-                path,
-                data,
-                ephemeral=True,
-                sequence=False,
-                makepath=True,
-            )
+            self.zk.create(path, data, ephemeral=True, sequence=False, makepath=True)
             logger.info(f"✅ OSD 注册成功: {osd_info['id']}")
             return True
         except Exception as e:
@@ -154,31 +154,11 @@ class ZKManager:
         try:
             path = f"{self.MDS_PATH}/{mds_info['id']}"
             data = json.dumps(mds_info).encode()
-
             self.zk.create(path, data, ephemeral=True, makepath=True)
             logger.info(f"✅ MDS 注册成功: {mds_info['id']}")
             return True
         except Exception as e:
             logger.error(f"❌ MDS 注册失败: {e}")
-            return False
-
-    def update_node_status(
-        self, node_type: NodeType, node_id: str, status: Dict[str, Any]
-    ) -> bool:
-        """更新节点状态"""
-        try:
-            if node_type == NodeType.OSD:
-                path = f"{self.OSD_PATH}/{node_id}"
-            elif node_type == NodeType.MDS:
-                path = f"{self.MDS_PATH}/{node_id}"
-            else:
-                return False
-
-            data = json.dumps(status).encode()
-            self.zk.set(path, data)
-            return True
-        except Exception as e:
-            logger.error(f"更新节点状态失败: {e}")
             return False
 
     # ========== 服务发现 ==========
@@ -193,7 +173,7 @@ class ZKManager:
                     data, _ = self.zk.get(f"{self.OSD_PATH}/{child}")
                     info = json.loads(data.decode())
                     osds.append(info)
-                except Exception:
+                except:
                     continue
             return osds
         except Exception as e:
@@ -210,7 +190,7 @@ class ZKManager:
                     data, _ = self.zk.get(f"{self.MDS_PATH}/{child}")
                     info = json.loads(data.decode())
                     mds_list.append(info)
-                except Exception:
+                except:
                     continue
             return mds_list
         except Exception as e:
@@ -225,8 +205,7 @@ class ZKManager:
             callback(osds)
 
         try:
-            children = self.zk.get_children(self.OSD_PATH, watch=watcher)
-            # 立即触发一次
+            self.zk.get_children(self.OSD_PATH, watch=watcher)
             osds = self.get_all_osds()
             callback(osds)
         except Exception as e:
@@ -240,7 +219,7 @@ class ZKManager:
             callback(mds_list)
 
         try:
-            children = self.zk.get_children(self.MDS_PATH, watch=watcher)
+            self.zk.get_children(self.MDS_PATH, watch=watcher)
             mds_list = self.get_all_mds()
             callback(mds_list)
         except Exception as e:
@@ -248,7 +227,7 @@ class ZKManager:
 
     # ========== 分布式锁 ==========
 
-    def acquire_lock(self, lock_name: str, timeout: float = 10) -> Optional[Lock]:
+    def acquire_lock(self, lock_name: str, timeout: float = 10):
         """获取分布式锁"""
         try:
             lock = Lock(self.zk, f"{self.LOCKS_PATH}/{lock_name}")
@@ -260,7 +239,7 @@ class ZKManager:
             logger.error(f"获取锁失败: {e}")
             return None
 
-    def release_lock(self, lock: Lock):
+    def release_lock(self, lock):
         """释放分布式锁"""
         try:
             lock.release()
@@ -270,17 +249,12 @@ class ZKManager:
     # ========== Leader 选举 ==========
 
     def elect_leader(self, node_id: str) -> bool:
-        """
-        尝试竞选 Leader
-        :return: True 表示成为 Leader
-        """
+        """尝试竞选 Leader"""
         try:
-            # 尝试创建临时节点
             self.zk.create(self.LEADER_PATH, node_id.encode(), ephemeral=True)
             logger.info(f"👑 {node_id} 成为 Leader")
             return True
         except NodeExistsException:
-            # 已有 Leader，监听变化
             return False
         except Exception as e:
             logger.error(f"选举失败: {e}")
@@ -361,7 +335,7 @@ class ZKManager:
                     data, _ = self.zk.get(f"{self.BLOCKS_PATH}/{child}")
                     info = json.loads(data.decode())
                     blocks.append(info)
-                except Exception:
+                except:
                     continue
             return blocks
         except Exception as e:
@@ -416,7 +390,7 @@ class ZKManager:
                     info = json.loads(data.decode())
                     if info.get("client_id") == client_id:
                         devices.append(info)
-                except Exception:
+                except:
                     continue
             return devices
         except Exception as e:
@@ -433,39 +407,21 @@ class ZKManager:
             data = json.dumps(status).encode()
             self.zk.set(path, data)
         except NoNodeException:
-            # 节点不存在，创建它
             try:
                 path = f"{self.HEARTBEAT_PATH}/{node_type.value}/{node_id}"
                 status["timestamp"] = time.time()
                 data = json.dumps(status).encode()
                 self.zk.create(path, data, ephemeral=True, makepath=True)
-            except Exception:
+            except:
                 pass
         except Exception as e:
             logger.error(f"发送心跳失败: {e}")
 
-    def get_node_heartbeat(self, node_type: NodeType, node_id: str) -> Optional[Dict]:
-        """获取节点心跳"""
-        try:
-            path = f"{self.HEARTBEAT_PATH}/{node_type.value}/{node_id}"
-            data, stat = self.zk.get(path)
-            info = json.loads(data.decode())
-            info["zk_stat"] = {
-                "ctime": stat.ctime,
-                "mtime": stat.mtime,
-                "version": stat.version,
-            }
-            return info
-        except Exception:
-            return None
-
 
 if __name__ == "__main__":
-    # 测试
     zk = ZKManager()
     if zk.start():
-        # 测试注册
-        zk.register_osd({"id": "osd-1", "host": "127.0.0.1", "port": 9100})
+        zk.register_osd({"id": "osd-test", "host": "127.0.0.1", "port": 9100})
         osds = zk.get_all_osds()
         print(f"OSDs: {osds}")
         zk.stop()
