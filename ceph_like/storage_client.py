@@ -1,0 +1,565 @@
+"""
+存储客户端
+支持：
+1. 通过 MDS 获取 OSD 拓扑
+2. 一致性哈希分配数据
+3. 多副本写入（顺时针N个节点）
+4. 读取最新版本
+5. 设备（Volume）管理
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import threading
+import logging
+import hashlib
+from typing import Dict, Any, List, Optional, Tuple
+
+from zk_manager import ZKManager, NodeType
+from consistent_hash import ConsistentHashRing
+from version_vector import VectorClock, VersionedValue, ConflictResolver
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [CLIENT-%(name)s] - %(message)s",
+)
+logger = logging.getLogger("StorageClient")
+
+
+class StorageClient:
+    """分布式存储客户端"""
+
+    def __init__(
+        self,
+        client_id: str = "client-1",
+        zk_hosts: str = "127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183",
+        replication_count: int = 3,
+        max_retry: int = 3,
+        timeout: int = 5,
+    ):
+        self.client_id = client_id
+        self.zk_hosts = zk_hosts
+        self.replication_count = replication_count
+        self.max_retry = max_retry
+        self.timeout = timeout
+
+        # ZK 管理器
+        self.zk = ZKManager(hosts=zk_hosts)
+
+        # 一致性哈希环
+        self.hash_ring = ConsistentHashRing()
+
+        # 本地缓存
+        self.devices: Dict[str, Dict] = {}  # {device_id: device_info}
+        self.block_osd_map: Dict[str, Dict] = {}  # {block_id: {primary, replicas}}
+
+        # 版本向量（用于并发写入）
+        self.version_clocks: Dict[str, VectorClock] = {}
+
+        # 锁
+        self.lock = threading.RLock()
+
+    def connect(self) -> bool:
+        """连接集群"""
+        if not self.zk.start():
+            logger.error("❌ ZK 连接失败")
+            return False
+
+        # 监听 OSD 变化
+        self._watch_osds()
+
+        # 加载设备信息
+        self._load_devices()
+
+        logger.info("✅ 客户端连接成功")
+        return True
+
+    def _watch_osds(self):
+        """监听 OSD 变化"""
+
+        def on_osds_change(osds: List[Dict]):
+            with self.lock:
+                # 重建哈希环
+                self.hash_ring = ConsistentHashRing()
+                for osd in osds:
+                    if osd.get("status") == "online":
+                        self.hash_ring.add_node(osd)
+
+            added = set(osd.get("id") for osd in osds) - {
+                n["id"] for n in self.hash_ring.get_all_nodes()
+            }
+            removed = {n["id"] for n in self.hash_ring.get_all_nodes()} - set(
+                osd.get("id") for osd in osds
+            )
+
+            if added:
+                logger.warning(f"🟢 OSD 加入: {added}")
+            if removed:
+                logger.error(f"🔴 OSD 下线: {removed}")
+
+            logger.info(f"📊 OSD 拓扑更新: {len(self.hash_ring)} 节点")
+
+        self.zk.watch_osds(on_osds_change)
+
+    def _load_devices(self):
+        """加载设备信息"""
+        try:
+            devices = self.zk.get_client_devices(self.client_id)
+            for device in devices:
+                self.devices[device["device_id"]] = device
+
+                # 加载块映射
+                blocks = device.get("blocks", [])
+                for block_id in blocks:
+                    block_meta = self.zk.get_block(block_id)
+                    if block_meta:
+                        self.block_osd_map[block_id] = {
+                            "primary": block_meta.get("primary_osd"),
+                            "replicas": block_meta.get("replica_osds", []),
+                        }
+
+            logger.info(f"💾 已加载 {len(self.devices)} 个设备")
+        except Exception as e:
+            logger.error(f"加载设备失败: {e}")
+
+    # ========== 设备管理 ==========
+
+    def create_device(
+        self, device_id: str, size_gb: int = 10, block_size: int = 4
+    ) -> bool:
+        """
+        创建设备
+        :param device_id: 设备ID
+        :param size_gb: 大小(GB)
+        :param block_size: 块大小(MB)
+        """
+        # 找到 Leader MDS
+        leader = self.zk.get_leader()
+        if not leader:
+            logger.error("❌ 无法找到 Leader MDS")
+            return False
+
+        # 直接通过 ZK 创建设备（简化实现）
+        # 实际应该通过 MDS API
+        try:
+            total_blocks = (size_gb * 1024) // block_size
+
+            # 为每个块分配 OSD
+            blocks = []
+            for i in range(total_blocks):
+                block_id = f"{device_id}-block-{i}"
+
+                # 使用一致性哈希
+                replicas = self.hash_ring.get_replicas(block_id, self.replication_count)
+                if len(replicas) < self.replication_count:
+                    logger.error("❌ OSD 数量不足")
+                    return False
+
+                osd_primary = replicas[0]
+                osd_replicas = replicas[1:]
+
+                block_meta = {
+                    "block_id": block_id,
+                    "device_id": device_id,
+                    "index": i,
+                    "primary_osd": osd_primary["id"],
+                    "replica_osds": [r["id"] for r in osd_replicas],
+                    "status": "allocated",
+                }
+
+                if self.zk.create_block(block_id, block_meta):
+                    blocks.append(block_id)
+                    self.block_osd_map[block_id] = {
+                        "primary": osd_primary["id"],
+                        "replicas": [r["id"] for r in osd_replicas],
+                    }
+
+            # 创建设备元数据
+            device_meta = {
+                "device_id": device_id,
+                "client_id": self.client_id,
+                "size_gb": size_gb,
+                "block_size": block_size,
+                "total_blocks": total_blocks,
+                "blocks": blocks,
+                "status": "active",
+                "created_at": time.time(),
+            }
+
+            result = self.zk.create_device(self.client_id, device_id, device_meta)
+            if result:
+                self.devices[device_id] = device_meta
+                logger.info(f"✅ 设备创建成功: {device_id}, {total_blocks} blocks")
+                return True
+            return False
+
+        except Exception as e:
+            logger.error(f"创建设备失败: {e}")
+            return False
+
+    def list_devices(self) -> List[Dict]:
+        """列出设备"""
+        return list(self.devices.values())
+
+    def get_device_info(self, device_id: str) -> Optional[Dict]:
+        """获取设备信息"""
+        return self.devices.get(device_id)
+
+    # ========== 数据读写 ==========
+
+    def _send_to_osd(
+        self, osd_id: str, command: str, timeout: int = None
+    ) -> Optional[str]:
+        """发送命令到 OSD"""
+        # 找到 OSD 信息
+        osd = None
+        for node in self.hash_ring.get_all_nodes():
+            if node["id"] == osd_id:
+                osd = node
+                break
+
+        if not osd:
+            return None
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout or self.timeout)
+            s.connect((osd["host"], osd["port"]))
+            s.sendall(command.encode())
+            resp = s.recv(65536).decode()
+            s.close()
+            return resp
+        except Exception as e:
+            logger.debug(f"OSD {osd_id} 请求失败: {e}")
+            return None
+
+    def _get_or_increment_clock(self, key: str) -> VectorClock:
+        """获取或递增版本向量"""
+        if key not in self.version_clocks:
+            self.version_clocks[key] = VectorClock({}, self.client_id)
+
+        self.version_clocks[key].increment(self.client_id)
+        return self.version_clocks[key]
+
+    def write(
+        self,
+        key: str,
+        value: str,
+        device_id: str = None,
+    ) -> bool:
+        """
+        写入数据（多副本）
+        :param key: 键
+        :param value: 值
+        :param device_id: 可选，指定设备
+        """
+        with self.lock:
+            # 1. 确定副本节点
+            replicas = self.hash_ring.get_replicas(key, self.replication_count)
+            if not replicas:
+                logger.error("❌ 无可用 OSD")
+                return False
+
+            # 2. 获取版本向量
+            vector_clock = self._get_or_increment_clock(key)
+            vc_json = vector_clock.to_json()
+
+            # 3. 写入所有副本
+            success = False
+            for osd in replicas:
+                cmd = f"PUT {key} {value} {vc_json}"
+                resp = self._send_to_osd(osd["id"], cmd)
+
+                if resp == "OK":
+                    success = True
+                    logger.info(
+                        f"✅ 写入成功: {key} -> {osd['id']} "
+                        f"(副本数: {self.replication_count})"
+                    )
+                else:
+                    logger.warning(f"⚠️ 副本写入失败: {osd['id']}: {resp}")
+
+            return success
+
+    def read(self, key: str) -> Optional[str]:
+        """
+        读取数据（读最新版本）
+        :param key: 键
+        """
+        with self.lock:
+            # 1. 确定主节点
+            primary = self.hash_ring.get_node(key)
+            if not primary:
+                logger.error("❌ 无可用 OSD")
+                return None
+
+            # 2. 尝试从主节点读取
+            cmd = f"GET {key}"
+            resp = self._send_to_osd(primary["id"], cmd)
+
+            if resp and resp != "NULL":
+                logger.info(
+                    f"✅ 读取成功: {key} = {resp[:50]}... (来自 {primary['id']})"
+                )
+                return resp
+
+            # 3. 主节点失败，尝试副本
+            replicas = self.hash_ring.get_replicas(key, self.replication_count)
+            for osd in replicas:
+                if osd["id"] == primary["id"]:
+                    continue
+                resp = self._send_to_osd(osd["id"], cmd)
+                if resp and resp != "NULL":
+                    logger.info(
+                        f"✅ 从副本读取成功: {key} = {resp[:50]}... (来自 {osd['id']})"
+                    )
+                    return resp
+
+            logger.warning(f"⚠️ 读取失败: {key}")
+            return None
+
+    def read_all_versions(self, key: str) -> List[Dict]:
+        """读取所有版本"""
+        with self.lock:
+            replicas = self.hash_ring.get_replicas(key, self.replication_count)
+            all_versions = []
+
+            for osd in replicas:
+                cmd = f"GET_VERSIONS {key}"
+                resp = self._send_to_osd(osd["id"], cmd)
+                if resp and resp != "NULL":
+                    try:
+                        versions = json.loads(resp)
+                        all_versions.extend([{"osd": osd["id"], **v} for v in versions])
+                    except:
+                        pass
+
+            return all_versions
+
+    def delete(self, key: str) -> bool:
+        """删除数据"""
+        with self.lock:
+            replicas = self.hash_ring.get_replicas(key, self.replication_count)
+            success = False
+
+            for osd in replicas:
+                cmd = f"DELETE {key}"
+                resp = self._send_to_osd(osd["id"], cmd)
+                if resp == "OK":
+                    success = True
+                    logger.info(f"🗑️ 删除成功: {key} @ {osd['id']}")
+
+            # 清理版本向量
+            if key in self.version_clocks:
+                del self.version_clocks[key]
+
+            return success
+
+    # ========== 设备块读写 ==========
+
+    def write_to_device(self, device_id: str, offset: int, data: str) -> bool:
+        """
+        写入设备（按块）
+        :param device_id: 设备ID
+        :param offset: 偏移量（MB）
+        :param data: 数据
+        """
+        device = self.devices.get(device_id)
+        if not device:
+            logger.error(f"❌ 设备不存在: {device_id}")
+            return False
+
+        blocks = device.get("blocks", [])
+        block_size = device.get("block_size", 4)
+
+        # 计算块索引
+        block_idx = offset // block_size
+        if block_idx >= len(blocks):
+            logger.error(f"❌ 偏移超出范围: {offset}")
+            return False
+
+        block_id = blocks[block_idx]
+        key = f"{device_id}:{block_idx}"
+
+        return self.write(key, data, device_id)
+
+    def read_from_device(
+        self, device_id: str, offset: int, size: int = None
+    ) -> Optional[str]:
+        """
+        读取设备（按块）
+        :param device_id: 设备ID
+        :param offset: 偏移量（MB）
+        :param size: 读取大小（MB），None 表示读取整个块
+        """
+        device = self.devices.get(device_id)
+        if not device:
+            logger.error(f"❌ 设备不存在: {device_id}")
+            return None
+
+        blocks = device.get("blocks", [])
+        block_size = device.get("block_size", 4)
+
+        # 计算块索引
+        block_idx = offset // block_size
+        if block_idx >= len(blocks):
+            logger.error(f"❌ 偏移超出范围: {offset}")
+            return None
+
+        block_id = blocks[block_idx]
+        key = f"{device_id}:{block_idx}"
+
+        return self.read(key)
+
+    # ========== 集群状态 ==========
+
+    def get_cluster_status(self) -> Dict[str, Any]:
+        """获取集群状态"""
+        return {
+            "client_id": self.client_id,
+            "connected": self.zk.is_connected(),
+            "osd_count": len(self.hash_ring),
+            "device_count": len(self.devices),
+            "leader_mds": self.zk.get_leader(),
+        }
+
+    def get_topology(self) -> Dict[str, Any]:
+        """获取拓扑"""
+        return {
+            "osds": self.hash_ring.get_all_nodes(),
+            "devices": list(self.devices.values()),
+        }
+
+    def disconnect(self):
+        """断开连接"""
+        self.zk.stop()
+        logger.info("客户端已断开")
+
+
+def main():
+    """客户端入口"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="分布式存储客户端")
+    parser.add_argument("--client-id", default="client-1", help="客户端ID")
+    parser.add_argument(
+        "--zk-hosts", default="127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183"
+    )
+    parser.add_argument("--replication", type=int, default=3, help="副本数")
+    args = parser.parse_args()
+
+    client = StorageClient(
+        client_id=args.client_id,
+        zk_hosts=args.zk_hosts,
+        replication_count=args.replication,
+    )
+
+    if not client.connect():
+        print("连接失败")
+        return
+
+    print(f"\n欢迎使用分布式存储客户端!")
+    print(f"客户端ID: {args.client_id}")
+    print(f"输入 help 查看命令\n")
+
+    while True:
+        try:
+            cmd = input("> ").strip()
+            if not cmd:
+                continue
+
+            parts = cmd.split()
+            action = parts[0].lower()
+
+            if action in ("exit", "quit"):
+                break
+
+            elif action == "help":
+                print("""
+命令帮助:
+  device create <id> <size_gb>   - 创建设备
+  device list                      - 列出设备
+  device info <id>                 - 设备详情
+  
+  write <key> <value>             - 写入数据
+  read <key>                       - 读取数据
+  delete <key>                     - 删除数据
+  
+  volume write <dev> <offset> <data> - 写入卷
+  volume read <dev> <offset>        - 读取卷
+  
+  status                           - 集群状态
+  topology                         - 拓扑信息
+  help                             - 显示帮助
+                """)
+
+            elif action == "device" and len(parts) >= 2:
+                if parts[1] == "create" and len(parts) >= 4:
+                    dev_id = parts[2]
+                    size = int(parts[3])
+                    client.create_device(dev_id, size)
+                elif parts[1] == "list":
+                    devices = client.list_devices()
+                    for d in devices:
+                        print(
+                            f"  {d['device_id']}: {d['size_gb']}GB, {d['total_blocks']} blocks"
+                        )
+                elif parts[1] == "info" and len(parts) >= 3:
+                    info = client.get_device_info(parts[2])
+                    if info:
+                        print(json.dumps(info, indent=2))
+                    else:
+                        print("设备不存在")
+
+            elif action == "write" and len(parts) >= 3:
+                key = parts[1]
+                value = " ".join(parts[2:])
+                client.write(key, value)
+
+            elif action == "read" and len(parts) >= 2:
+                key = parts[1]
+                result = client.read(key)
+                if result:
+                    print(result)
+
+            elif action == "delete" and len(parts) >= 2:
+                key = parts[1]
+                client.delete(key)
+
+            elif action == "volume" and len(parts) >= 3:
+                if parts[1] == "write" and len(parts) >= 5:
+                    dev = parts[2]
+                    offset = int(parts[3])
+                    data = " ".join(parts[4:])
+                    client.write_to_device(dev, offset, data)
+                elif parts[1] == "read" and len(parts) >= 4:
+                    dev = parts[2]
+                    offset = int(parts[3])
+                    result = client.read_from_device(dev, offset)
+                    if result:
+                        print(result)
+
+            elif action == "status":
+                status = client.get_cluster_status()
+                print(json.dumps(status, indent=2))
+
+            elif action == "topology":
+                topo = client.get_topology()
+                print(json.dumps(topo, indent=2))
+
+            else:
+                print("未知命令，输入 help 查看帮助")
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"错误: {e}")
+
+    client.disconnect()
+
+
+if __name__ == "__main__":
+    main()
