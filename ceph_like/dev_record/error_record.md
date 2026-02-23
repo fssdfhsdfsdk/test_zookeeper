@@ -41,3 +41,12 @@ Warning: kazoo not installed. Run: pip install kazoo: cannot import name 'Sessio
 > 
 
 ```
+
+
+```
+2026-02-23 18:14:44,436 - [ZKManager] - 当前 Leader: , 设置监听...
+2026-02-23 18:14:46,438 - [ZKManager] - Leader 节点已存在: , version: 0
+2026-02-23 18:14:46,438 - [ZKManager] - 当前 Leader: , 设置监听...
+```
+
+Leader节点存在但是数据为空。这意味着之前的选举创建了一个空节点。我需要：1. 在选举时检查Leader节点是否为空2. 如果为空，删除它并重新创建让我修复elect_leader函数。

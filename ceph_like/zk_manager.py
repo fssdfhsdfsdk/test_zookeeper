@@ -76,7 +76,6 @@ class ZKManager:
         self.HEARTBEAT_PATH = f"{root_path}/heartbeat"
 
     def start(self) -> bool:
-        """连接到ZK集群"""
         if KazooClient is None:
             logger.error("KazooClient not available")
             return False
@@ -87,7 +86,6 @@ class ZKManager:
             self._running = True
             self._session_id = self.zk.client_id
 
-            # 确保必要的路径存在
             self.zk.ensure_path(self.OSD_PATH)
             self.zk.ensure_path(self.MDS_PATH)
             self.zk.ensure_path(self.BLOCKS_PATH)
@@ -96,7 +94,6 @@ class ZKManager:
             self.zk.ensure_path(self.LOCKS_PATH)
             self.zk.ensure_path(self.HEARTBEAT_PATH)
 
-            # 注册状态监听
             self.zk.add_listener(self._on_state_change)
 
             logger.info(f"✅ 连接到 ZK 集群: {self.hosts}")
@@ -106,7 +103,6 @@ class ZKManager:
             return False
 
     def stop(self):
-        """断开ZK连接"""
         self._running = False
         if self.zk:
             try:
@@ -132,8 +128,6 @@ class ZKManager:
         except:
             return False
 
-    # ========== 服务注册 ==========
-
     def register_osd(self, osd_info: Dict[str, Any]) -> bool:
         try:
             path = f"{self.OSD_PATH}/{osd_info['id']}"
@@ -155,8 +149,6 @@ class ZKManager:
         except Exception as e:
             logger.error(f"❌ MDS 注册失败: {e}")
             return False
-
-    # ========== 服务发现 ==========
 
     def get_all_osds(self) -> List[Dict[str, Any]]:
         try:
@@ -210,10 +202,18 @@ class ZKManager:
             # 先检查 Leader 节点状态
             try:
                 data, stat = self.zk.get(self.LEADER_PATH)
-                logger.info(
-                    f"Leader 节点已存在: {data.decode()}, version: {stat.version}"
-                )
-                return False
+                leader_value = data.decode() if data else ""
+
+                # 如果Leader节点存在但值为空，说明是残留节点，删除它
+                if not leader_value:
+                    logger.warning("Leader 节点为空，删除残留节点...")
+                    self.zk.delete(self.LEADER_PATH)
+                else:
+                    logger.info(
+                        f"Leader 节点已存在: {leader_value}, version: {stat.version}"
+                    )
+                    return False
+
             except NoNodeException:
                 logger.info("Leader 节点不存在，准备创建...")
 
@@ -242,7 +242,6 @@ class ZKManager:
             callback(leader_id)
 
         try:
-            # 先获取当前状态
             try:
                 data, stat = self.zk.get(self.LEADER_PATH)
                 logger.info(f"当前 Leader: {data.decode()}, 设置监听...")
@@ -254,7 +253,6 @@ class ZKManager:
             logger.error(f"监听 Leader 失败: {e}")
 
     def get_leader(self) -> Optional[str]:
-        """获取当前 Leader"""
         try:
             data, _ = self.zk.get(self.LEADER_PATH)
             return data.decode() if data else None
