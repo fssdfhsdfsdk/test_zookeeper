@@ -1,0 +1,41 @@
+version: '3.8'
+services:
+  zk1:
+    image: zookeeper:3.8
+    container_name: zk1
+    restart: always
+    ports:
+      - "2181:2181"
+    environment:
+      - ZOO_MY_ID=1
+      - ZOO_SERVERS=server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181
+    networks:
+      - zk-net
+
+  zk2:
+    image: zookeeper:3.8
+    container_name: zk2
+    restart: always
+    ports:
+      - "2182:2181"
+    environment:
+      - ZOO_MY_ID=2
+      - ZOO_SERVERS=server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181
+    networks:
+      - zk-net
+
+  zk3:
+    image: zookeeper:3.8
+    container_name: zk3
+    restart: always
+    ports:
+      - "2183:2181"
+    environment:
+      - ZOO_MY_ID=3
+      - ZOO_SERVERS=server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181
+    networks:
+      - zk-net
+
+networks:
+  zk-net:
+    driver: bridge
